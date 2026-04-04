@@ -93,6 +93,13 @@ inline void update_suspension(
     // Roll stiffness per axle determines how lateral load transfer splits
     // front/rear. This is the thing that actually controls steady-state balance.
     //
+    // The ARB contributes to the roll stiffness that determines the front/rear
+    // split of total lateral load transfer. The deflection target is then
+    // derived from the target load (which includes the ARB's effect on the
+    // split). The force output uses spring + damper only — no separate ARB
+    // force term — because the target deflection already encodes the ARB's
+    // contribution. Adding an explicit ARB force would double-count it.
+    //
     //   K_roll = (K_spring / 2) * (t/2)^2 + K_arb * (t/2)^2
     //
     // The /2 on the spring: in roll, one side compresses while the other
@@ -122,21 +129,12 @@ inline void update_suspension(
         static_load[3] + dFz_long / 2.0 + dFz_lat_rear,
     }};
 
-    // Target deflection: how far the spring needs to move from static preload
+    // Target deflection: how far the spring needs to move from static preload.
+    // This already includes the ARB's effect via the K_roll front/rear split —
+    // no separate ARB force term in the force output.
     std::array<double, 4> target_defl;
     for (int i = 0; i < 4; ++i)
         target_defl[i] = (target_load[i] - static_load[i]) / params.corners[i].spring_rate;
-
-    // ARB forces from current deflection difference (left minus right)
-    double arb_diff_front = state.corners[0].deflection - state.corners[1].deflection;
-    double arb_diff_rear  = state.corners[2].deflection - state.corners[3].deflection;
-
-    std::array<double, 4> arb_force = {{
-        -params.arb_rate_front * arb_diff_front,
-         params.arb_rate_front * arb_diff_front,
-        -params.arb_rate_rear  * arb_diff_rear,
-         params.arb_rate_rear  * arb_diff_rear,
-    }};
 
     // Per-corner: first-order filter on deflection, asymmetric damping.
     //
@@ -169,9 +167,9 @@ inline void update_suspension(
 
         cs.spring_force = cp.spring_rate * cs.deflection + static_load[i] + bump_force;
         cs.damper_force = c_damp * cs.velocity;
-        cs.arb_force = arb_force[i];
+        cs.arb_force = 0;  // ARB effect is in K_roll → target_defl, not a separate force
 
-        cs.force = std::max(0.0, cs.spring_force + cs.damper_force + cs.arb_force + unsprung_weight);
+        cs.force = std::max(0.0, cs.spring_force + cs.damper_force + unsprung_weight);
     }
 
     // Body attitude from deflection geometry (small angle)

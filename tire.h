@@ -36,6 +36,7 @@ struct TireParams {
     PacejkaCoeffs lateral = {7.0, 1.9, 1.0, -0.5};
 
     double mu_peak = 1.0;  // dry tarmac
+    double Fz_nominal = 3434;   // [N] nominal load for load sensitivity (~W/4)
 
     // Relaxation length — how far the tire rolls before Fy reaches steady
     // state. Without this the yaw response is way too twitchy. ~0.3-0.5m
@@ -110,6 +111,11 @@ inline void compute_tire_forces(
     }
     st.Fy = st.Fy_filtered;
 
+    // Rolling resistance. Small but it matters for top speed.
+    // Applied before the friction circle so it's part of the friction budget.
+    // SIMPLIFICATION: constant Crr, no temp/pressure/speed dependence.
+    st.Fx -= p.rolling_resistance * Fz;
+
     // Friction circle (Beckman's "traction circle"). Total force can't exceed
     // mu * Fz. If combined Fx+Fy would bust through, scale both back.
     // SIMPLIFICATION: real tires are slightly elliptical, not circular.
@@ -120,8 +126,4 @@ inline void compute_tire_forces(
         st.Fx *= s;
         st.Fy *= s;
     }
-
-    // Rolling resistance. Small but it matters for top speed.
-    // SIMPLIFICATION: constant Crr, no temp/pressure/speed dependence.
-    st.Fx -= p.rolling_resistance * Fz;
 }

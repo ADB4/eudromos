@@ -119,6 +119,9 @@ struct Vehicle {
     VehicleState state;
 
     // Set static normal loads so the car doesn't start with Fz=0 on frame 1.
+    // Also sets Fz_nominal for load sensitivity — each corner's reference load
+    // is its own static weight. Front corners are heavier on this car (55/45),
+    // so they lose proportionally more mu under lateral transfer.
     void init() {
         constexpr double g = 9.81;
         double L = params.wheelbase;
@@ -130,6 +133,13 @@ struct Vehicle {
             state.tires[i].normal_load = loads[i];
             state.suspension.corners[i].force = loads[i];
         }
+
+        // Fz_nominal = average static corner load. Using the average rather
+        // than per-corner values means the front (heavier) tires start with
+        // mu slightly below mu_peak and the rear slightly above, which is a
+        // mild built-in understeer bias. You could use per-corner Fz_nom
+        // instead if you want load sensitivity to be purely about *transfer*.
+        params.tire_params.Fz_nominal = W / 4.0;
     }
 
     // --- Force computation: the part you own forever ---
@@ -216,6 +226,16 @@ struct Vehicle {
         for (int i = 0; i < 4; ++i)
             compute_tire_forces(state.tires[i], params.tire_params, wvel[i].Vx, wvel[i].Vy, dt);
 
+        // Differential — splits drive torque between rear wheels based on
+        // their speed difference and the diff type (open/locked/LSD).
+        DiffState diff = diff_split_torque(
+            state.drivetrain.diff_params,
+            drive_torque,
+            state.tires[RL].omega,
+            state.tires[RR].omega
+        );
+        state.drivetrain.diff_state = diff;
+
         // Wheel spin dynamics: I_w * domega/dt = drive - brake - Fx*R
         // SIMPLIFICATION: lumped inertia, no separate brake rotor/hub
         constexpr double I_wheel = 1.5;  // [kg·m²]
@@ -224,8 +244,8 @@ struct Vehicle {
         for (int i = 0; i < 4; ++i) {
             double torque = 0;
 
-            if (i == RL || i == RR)
-                torque += drive_torque / 2;  // RWD, 50/50 split, no diff
+            if (i == RL)      torque += diff.torque_left;
+            else if (i == RR) torque += diff.torque_right;
 
             if (state.tires[i].omega > 0.01)       torque -= brake_per_wheel;
             else if (state.tires[i].omega < -0.01)  torque += brake_per_wheel;
