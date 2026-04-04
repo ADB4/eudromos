@@ -3,37 +3,37 @@
 //
 // No clutch (instant engagement), no diff (50/50 split), no flywheel inertia.
 // Just enough to get plausible torque to the rear wheels through a 6-speed box.
+//
+// std::vector replaced with std::array — these are fixed at compile time and
+// the heap allocations were gratuitous. Matters when you're spawning traffic.
 
 #include <cmath>
 #include <algorithm>
-#include <vector>
+#include <array>
 
 struct EngineTorqueCurve {
     struct Point { double rpm, torque_nm; };
-    std::vector<Point> points;
 
     // Loosely a 2.0L NA inline-4, ~200hp peak. Piecewise linear from dyno-ish data.
-    EngineTorqueCurve() {
-        points = {
-            {   0,   0},
-            {1000, 120},
-            {2000, 180},
-            {3000, 230},
-            {4000, 260},
-            {4500, 270},  // peak torque
-            {5000, 265},
-            {6000, 245},  // peak power lives around here
-            {7000, 210},
-            {7500, 180},
-            {8000,   0},  // fuel cut
-        };
-    }
+    static constexpr int N_POINTS = 11;
+    std::array<Point, N_POINTS> points = {{
+        {   0,   0},
+        {1000, 120},
+        {2000, 180},
+        {3000, 230},
+        {4000, 260},
+        {4500, 270},  // peak torque
+        {5000, 265},
+        {6000, 245},  // peak power lives around here
+        {7000, 210},
+        {7500, 180},
+        {8000,   0},  // fuel cut
+    }};
 
     double torque_at_rpm(double rpm) const {
-        if (points.empty()) return 0;
         if (rpm <= points.front().rpm) return points.front().torque_nm;
         if (rpm >= points.back().rpm) return points.back().torque_nm;
-        for (size_t i = 0; i + 1 < points.size(); ++i) {
+        for (int i = 0; i + 1 < N_POINTS; ++i) {
             if (rpm <= points[i + 1].rpm) {
                 double t = (rpm - points[i].rpm) / (points[i+1].rpm - points[i].rpm);
                 return points[i].torque_nm + t * (points[i+1].torque_nm - points[i].torque_nm);
@@ -42,27 +42,24 @@ struct EngineTorqueCurve {
         return 0;
     }
 
-    double max_rpm() const { return points.empty() ? 0 : points.back().rpm; }
+    double max_rpm() const { return points.back().rpm; }
     double idle_rpm() const { return 1000; }
 };
 
 struct Gearbox {
-    std::vector<double> ratios;
+    static constexpr int N_GEARS = 6;
+    std::array<double, N_GEARS> ratios = {3.58, 2.02, 1.35, 1.00, 0.77, 0.63};
     double final_drive = 3.42;
     int current_gear = 0;         // 0-indexed
     double shift_cooldown = 0.0;  // time left in current shift
     double shift_time = 0.2;      // seconds per shift
 
-    Gearbox() {
-        ratios = {3.58, 2.02, 1.35, 1.00, 0.77, 0.63}; // typical sport sedan
-    }
-
     double total_ratio() const {
-        if (current_gear < 0 || current_gear >= (int)ratios.size()) return 0;
+        if (current_gear < 0 || current_gear >= N_GEARS) return 0;
         return ratios[current_gear] * final_drive;
     }
 
-    int gear_count() const { return (int)ratios.size(); }
+    int gear_count() const { return N_GEARS; }
     bool is_shifting() const { return shift_cooldown > 0; }
 
     void shift_up() {
@@ -88,10 +85,8 @@ struct Drivetrain {
     EngineTorqueCurve engine;
     Gearbox gearbox;
 
-    double throttle = 0;
-    double brake_input = 0;
-    double brake_torque_max = 3000;    // per axle [Nm]
     double engine_rpm = 1000;
+    double brake_torque_max = 3000;    // per axle [Nm]
     double engine_braking_factor = 0.02;
 
     // Anti-hunt timer: after a shift, lock out further shifts for a bit.
@@ -107,7 +102,7 @@ struct Drivetrain {
     }
 
     // Returns total drive torque at the wheels (caller splits between L/R).
-    double get_drive_torque() const {
+    double get_drive_torque(double throttle) const {
         if (gearbox.is_shifting()) return 0;
 
         double ratio = gearbox.total_ratio();
@@ -124,11 +119,11 @@ struct Drivetrain {
     }
 
     // SIMPLIFICATION: equal brake torque all 4 wheels (should be ~60/40 front bias)
-    double get_brake_torque_per_wheel() const {
+    double get_brake_torque_per_wheel(double brake_input) const {
         return brake_input * brake_torque_max * 0.25;
     }
 
-    void auto_shift() {
+    void auto_shift(double throttle) {
         if (shift_lockout_timer > 0) return;
 
         if (engine_rpm >= 6500 && throttle > 0.5) {

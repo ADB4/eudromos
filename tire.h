@@ -32,7 +32,7 @@ struct TireParams {
     PacejkaCoeffs longitudinal = {10.0, 1.9, 1.0, 0.97};
 
     // Lateral: peaks around 8° slip angle, falls off past that.
-    //   2°→44%  4°→78%  6°→95%  8°→100%  10°→97%  15°→82%  20°→69%
+    //   2°→44%  4°→78%  6°→95%  8°→100%  10°→97%  15%→82%  20°→69%
     PacejkaCoeffs lateral = {7.0, 1.9, 1.0, -0.5};
 
     double mu_peak = 1.0;  // dry tarmac
@@ -123,7 +123,5 @@ inline void compute_tire_forces(
 
     // Rolling resistance. Small but it matters for top speed.
     // SIMPLIFICATION: constant Crr, no temp/pressure/speed dependence.
-    if (std::abs(Vx_local) > 0.1) {
-        st.Fx += -p.rolling_resistance * Fz * (Vx_local > 0 ? 1.0 : -1.0);
-    }
+    st.Fx -= p.rolling_resistance * Fz;
 }
