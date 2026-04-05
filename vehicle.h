@@ -72,11 +72,25 @@ struct VehicleParams {
     // SIMPLIFICATION: no roll/pitch DOF in integrator — just yaw on flat ground.
     double Izz = 2800;  // yaw moment of inertia [kg·m²]
 
-    // Aero drag. SIMPLIFICATION: no downforce.
+    // Aero drag.
     // At ~56 m/s (200 kph): F_drag ≈ 0.5 * 1.225 * 0.35 * 2.2 * 56² ≈ 1500 N
     double drag_coefficient = 0.35;
     double frontal_area = 2.2;
     double air_density = 1.225;
+
+    // Aero downforce. Cl*A is the lift coefficient times reference area — same
+    // form as drag (F = 0.5 * rho * Cl*A * V²), but pushing the car down
+    // instead of back. Street cars have nearly zero; a GT3 car might be 2.5-3.0;
+    // an LMP or F1 car can be 4-5+. Defaulting to mild track-day aero — small
+    // wing and splitter.
+    //
+    // aero_balance is the fraction of total downforce on the front axle.
+    // 0.4 = 40% front, 60% rear — typical for rear-wing-dominant setups.
+    // This directly controls high-speed understeer/oversteer: more front
+    // downforce = more front grip at speed = less understeer (or more oversteer).
+    // It's the primary setup knob on any aero car.
+    double downforce_ClA = 1.2;       // [m²] Cl * A — mild aero
+    double aero_balance_front = 0.40; // [-] fraction of downforce on front axle
 
     TireParams tire_params;
     SuspensionParams suspension_params;
@@ -210,6 +224,25 @@ struct Vehicle {
         for (int i = 0; i < 4; ++i)
             state.tires[i].normal_load = state.suspension.corners[i].force;
 
+        // Aero downforce — adds normal load without adding mass. Scales with
+        // V², so it's negligible at low speed and dominant at high speed.
+        // Because of load sensitivity, this is sublinear in grip gain — but
+        // it's still free grip that costs no weight transfer penalty. That's
+        // why aero cars corner so much harder than their weight suggests.
+        //
+        // The downforce acts at the contact patch, not at the CG, so it
+        // doesn't go through the suspension springs. It's added directly
+        // to the tire's normal load after the suspension has done its thing.
+        double V2 = state.Vx_body * state.Vx_body + state.Vy_body * state.Vy_body;
+        double F_down = 0.5 * params.air_density * params.downforce_ClA * V2;
+        double F_down_front = F_down * params.aero_balance_front;
+        double F_down_rear  = F_down * (1.0 - params.aero_balance_front);
+
+        state.tires[FL].normal_load += F_down_front / 2.0;
+        state.tires[FR].normal_load += F_down_front / 2.0;
+        state.tires[RL].normal_load += F_down_rear  / 2.0;
+        state.tires[RR].normal_load += F_down_rear  / 2.0;
+
         // Drivetrain
         double omega_rear = (state.tires[RL].omega + state.tires[RR].omega) / 2;
         state.drivetrain.update_rpm_from_wheel_speed(omega_rear);
@@ -219,7 +252,6 @@ struct Vehicle {
             state.drivetrain.shift_lockout_timer -= dt;
 
         double drive_torque = state.drivetrain.get_drive_torque(input.throttle);
-        double brake_per_wheel = state.drivetrain.get_brake_torque_per_wheel(input.brake);
 
         // Tire forces
         auto wvel = compute_wheel_velocities(input.steer_angle);
@@ -247,8 +279,11 @@ struct Vehicle {
             if (i == RL)      torque += diff.torque_left;
             else if (i == RR) torque += diff.torque_right;
 
-            if (state.tires[i].omega > 0.01)       torque -= brake_per_wheel;
-            else if (state.tires[i].omega < -0.01)  torque += brake_per_wheel;
+            bool is_front = (i == FL || i == FR);
+            double brake_torque = state.drivetrain.get_brake_torque_per_wheel(input.brake, is_front);
+
+            if (state.tires[i].omega > 0.01)       torque -= brake_torque;
+            else if (state.tires[i].omega < -0.01)  torque += brake_torque;
 
             torque -= state.tires[i].Fx * tire_R;  // ground reaction
 
@@ -287,7 +322,7 @@ struct Vehicle {
             yaw_torque += rx * fy - ry * fx;
         }
 
-        // Aero drag in body frame
+        // Aero drag in body frame (downforce is already applied to tire Fz above)
         double spd = state.speed_mps();
         if (spd > 0.1) {
             double Fd = 0.5 * params.air_density * params.drag_coefficient

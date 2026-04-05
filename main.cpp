@@ -19,6 +19,121 @@
 constexpr double DT       = 1.0 / 120.0;  // 120 Hz
 constexpr int    LOG_SKIP = 12;            // log every 12th tick → ~10 Hz output
 
+// ── Energy audit ────────────────────────────────────────────────────────
+//
+// Tracks power flow through the drivetrain every tick and integrates to
+// get cumulative energy [J] in each pathway. The balance check:
+//
+//   energy_in - energy_drag - energy_brake - energy_tire_slip ≈ ΔKE
+//
+// Any persistent drift means the integrator is creating or destroying energy.
+// Reported as energy_balance = (energy_in - losses) - ΔKE. Should stay near 0.
+//
+// When drivetrain inertia is added later, the KE calculation gains a
+// 0.5 * I_flywheel * omega_engine² term and the energy_in pathway splits
+// into engine→flywheel and flywheel→wheels.
+
+struct EnergyAuditor {
+    // Cumulative energy through each pathway [J]
+    double energy_engine    = 0;  // drive torque × wheel omega (signed; negative = engine braking)
+    double energy_drag      = 0;  // aero drag power dissipated
+    double energy_brake     = 0;  // brake torque × |wheel omega|
+    double energy_body      = 0;  // F_body · V_body + Mz · yaw_rate (what the integrator applies)
+
+    // Initial KE (set on first call)
+    double ke_initial = 0;
+    double ke_body_initial = 0;
+    bool   initialized = false;
+
+    // Per-frame values for CSV
+    double ke_current       = 0;
+    double balance          = 0;  // integrator error: energy_body - ΔKE
+    double tire_loss        = 0;  // derived: engine - drag - brake - body power
+
+    void update(const Vehicle& car, const VehicleInput& input,
+                const VehicleForces& forces, double dt) {
+        const auto& s = car.state;
+        const auto& p = car.params;
+        constexpr double I_wheel = 1.5;
+
+        // ── Kinetic energy, split into body and wheels ──
+        double ke_body = 0.5 * p.mass * s.velocity.length_sq()
+                       + 0.5 * p.Izz * s.yaw_rate * s.yaw_rate;
+        double ke_wheels = 0;
+        for (int i = 0; i < 4; ++i)
+            ke_wheels += 0.5 * I_wheel * s.tires[i].omega * s.tires[i].omega;
+        ke_current = ke_body + ke_wheels;
+
+        if (!initialized) {
+            ke_initial = ke_current;
+            ke_body_initial = ke_body;
+            initialized = true;
+            return;
+        }
+
+        // ── Engine power: drive torque at each driven wheel × omega ──
+        double drive_torque = s.drivetrain.get_drive_torque(input.throttle);
+        for (int i = RL; i <= RR; ++i)
+            energy_engine += (drive_torque / 2.0) * s.tires[i].omega * dt;
+
+        // ── Aero drag dissipation: Fd · V ──
+        double spd = s.speed_mps();
+        if (spd > 0.1) {
+            double Fd = 0.5 * p.air_density * p.drag_coefficient
+                      * p.frontal_area * spd * spd;
+            energy_drag += Fd * spd * dt;
+        }
+
+        // ── Brake dissipation: brake torque × |omega| per wheel ──
+        for (int i = 0; i < 4; ++i) {
+            bool front = (i == FL || i == FR);
+            double bt = s.drivetrain.get_brake_torque_per_wheel(input.brake, front);
+            energy_brake += bt * std::abs(s.tires[i].omega) * dt;
+        }
+
+        // ── Body power: what the integrator applies to the rigid body ──
+        // P = F_body · V_body + M_yaw · yaw_rate
+        double p_body = forces.Fx_body * s.Vx_body
+                      + forces.Fy_body * s.Vy_body
+                      + forces.yaw_torque * s.yaw_rate;
+        energy_body += p_body * dt;
+
+        // ── Derived quantities ──
+        tire_loss = energy_engine - energy_drag - energy_brake - energy_body;
+
+        // Integrator error: compare body power integral to actual body ΔKE.
+        // These use the same force and the same velocity — the only difference
+        // is whether you integrate P·dt or look at 0.5·m·V². Any gap is
+        // numerical error from the semi-implicit Euler scheme.
+        double delta_ke_body = ke_body - ke_body_initial;
+        balance = energy_body - delta_ke_body;
+    }
+
+    void report() const {
+        double delta_ke = ke_current - ke_initial;
+        double integrator_err = energy_body - (ke_current - ke_body_initial
+                              - (ke_initial - ke_body_initial));
+        // Simplifies to: energy_body - (ke_body_final - ke_body_initial)
+        // but we don't store ke_body_final, so use balance from last update.
+        std::cerr << "\n── energy audit ──\n"
+                  << "  KE initial:      " << ke_initial / 1000 << " kJ\n"
+                  << "  KE final:        " << ke_current / 1000 << " kJ\n"
+                  << "  ΔKE:             " << delta_ke / 1000 << " kJ\n"
+                  << "  engine in:       " << energy_engine / 1000 << " kJ\n"
+                  << "  losses:\n"
+                  << "    aero drag:     " << energy_drag / 1000 << " kJ\n"
+                  << "    brakes:        " << energy_brake / 1000 << " kJ\n"
+                  << "    tire/rr:       " << tire_loss / 1000 << " kJ"
+                  << "  (slip + rolling resistance)\n"
+                  << "  body power:      " << energy_body / 1000 << " kJ"
+                  << "  (applied to rigid body)\n"
+                  << "  integrator err:  " << balance / 1000 << " kJ"
+                  << "  (" << (std::abs(energy_body) > 1
+                     ? balance / energy_body * 100 : 0)
+                  << "% of body power)\n";
+    }
+};
+
 // ── CSV logging ─────────────────────────────────────────────────────────
 
 void csv_header() {
@@ -38,11 +153,15 @@ void csv_header() {
         // ── new diagnostic columns ──
         "fz_total,understeer_deg,"
         "fc_util_fl,fc_util_fr,fc_util_rl,fc_util_rr,"
-        "radius_m,yaw_rate_ref_dps\n";
+        "radius_m,yaw_rate_ref_dps,"
+        // ── energy audit columns ──
+        "ke_total_kj,energy_engine_kj,energy_drag_kj,energy_brake_kj,"
+        "energy_tire_loss_kj,energy_body_kj,integrator_err_kj\n";
 }
 
 void csv_row(double t, const std::string& phase, const VehicleInput& in,
              const VehicleState& s, double lat_g,
+             const EnergyAuditor& energy,
              double ref_yaw_rate = 0.0) {
     constexpr double R2D = 180.0 / M_PI;
     auto& w = s.tires;
@@ -105,7 +224,15 @@ void csv_row(double t, const std::string& phase, const VehicleInput& in,
         // new columns
         << fz_total << "," << understeer_deg << ","
         << fc_fl << "," << fc_fr << "," << fc_rl << "," << fc_rr << ","
-        << radius << "," << ref_yaw_rate * R2D << "\n";
+        << radius << "," << ref_yaw_rate * R2D << ","
+        // energy audit (kJ for human readability)
+        << energy.ke_current / 1000 << ","
+        << energy.energy_engine / 1000 << ","
+        << energy.energy_drag / 1000 << ","
+        << energy.energy_brake / 1000 << ","
+        << energy.tire_loss / 1000 << ","
+        << energy.energy_body / 1000 << ","
+        << (energy.energy_body - (energy.ke_current - energy.ke_initial)) / 1000 << "\n";
 }
 
 // ── Scenario infrastructure ─────────────────────────────────────────────
@@ -404,6 +531,7 @@ int main(int argc, char* argv[]) {
     csv_header();
 
     DiagnosticAccumulator diag;
+    EnergyAuditor energy;
     double lat_g = 0;
     int tick = 0;
     bool stopped = false;
@@ -412,12 +540,13 @@ int main(int argc, char* argv[]) {
         auto [input, phase, ref_yaw_rate] = dispatch(cfg.type, t, car.state);
 
         if (tick % LOG_SKIP == 0)
-            csv_row(t, phase, input, car.state, lat_g, ref_yaw_rate);
+            csv_row(t, phase, input, car.state, lat_g, energy, ref_yaw_rate);
 
         VehicleForces forces = car.compute_forces(input, DT);
         lat_g = forces.lateral_accel_g;
         car.integrate(forces, DT);
 
+        energy.update(car, input, forces, DT);
         diag.update(car.state, input);
 
         // Early termination for brake_stop once the car is stopped
@@ -435,4 +564,5 @@ int main(int argc, char* argv[]) {
               << "  ticks " << tick << "\n";
 
     diag.report(car.params.mass);
+    energy.report();
 }

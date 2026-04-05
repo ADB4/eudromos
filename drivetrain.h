@@ -227,8 +227,16 @@ struct Drivetrain {
     DiffState diff_state;  // last frame's output, for diagnostics
 
     double engine_rpm = 1000;
-    double brake_torque_max = 3000;    // per axle [Nm]
+    double brake_torque_max = 3000;    // total, all 4 wheels [Nm]
     double engine_braking_factor = 0.02;
+
+    // Brake bias: fraction of total braking that goes to the front axle.
+    // 0.6 = 60% front, 40% rear — typical street car with front weight bias.
+    // Higher = more front braking = more stable under braking but less rear
+    // deceleration, so you waste front grip. Lower = more rear braking =
+    // better threshold braking but easier to lock the rears and spin.
+    // Race cars run adjustable bias, usually 55-65% front depending on setup.
+    double brake_bias_front = 0.6;
 
     // Anti-hunt timer: after a shift, lock out further shifts for a bit.
     // Without this, the RPM drop from an upshift can trigger an immediate
@@ -259,9 +267,12 @@ struct Drivetrain {
         return t_engine * ratio * 0.88;
     }
 
-    // SIMPLIFICATION: equal brake torque all 4 wheels (should be ~60/40 front bias)
-    double get_brake_torque_per_wheel(double brake_input) const {
-        return brake_input * brake_torque_max * 0.25;
+    // Brake torque per wheel, split by bias. Front gets brake_bias_front of
+    // the total, rear gets the rest. Each axle has two wheels, so divide by 2.
+    double get_brake_torque_per_wheel(double brake_input, bool is_front) const {
+        double total = brake_input * brake_torque_max;
+        double axle_frac = is_front ? brake_bias_front : (1.0 - brake_bias_front);
+        return total * axle_frac / 2.0;
     }
 
     void auto_shift(double throttle) {
