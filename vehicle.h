@@ -69,6 +69,15 @@ struct VehicleParams {
     double cg_to_rear = 1.43;   // cg_to_front + cg_to_rear = wheelbase
     double cg_height = 0.50;    // [m] above ground
 
+    // Ackermann steering geometry. At 100% Ackermann, the inside wheel
+    // steers more than the outside so both front wheels point at the same
+    // turn center. At 0% both wheels steer identically (parallel steer).
+    // Most road cars run 60-80%. Some race cars run negative Ackermann
+    // (outside steers more) at high speed because the loaded outside tire
+    // needs more slip angle. The bicycle model steer angle is the average
+    // of the two wheels.
+    double ackermann_pct = 0.6;  // [-] 0 = parallel, 1 = full Ackermann
+
     // SIMPLIFICATION: no roll/pitch DOF in integrator — just yaw on flat ground.
     double Izz = 2800;  // yaw moment of inertia [kg·m²]
 
@@ -164,11 +173,32 @@ struct Vehicle {
 
     struct WheelVel { double Vx, Vy; };
 
-    std::array<WheelVel, 4> compute_wheel_velocities(double steer_angle) const {
+    // Ackermann geometry: the inside wheel steers more than the outside.
+    // For a left turn (positive steer), FL is the inside wheel.
+    //
+    // Full Ackermann: each wheel points at the instantaneous turn center,
+    // so tan(delta_inside) = L / (R - t/2) and tan(delta_outside) = L / (R + t/2).
+    // For small angles this simplifies to a linear split around the mean:
+    //   delta_inside  = delta_mean + ackermann_correction
+    //   delta_outside = delta_mean - ackermann_correction
+    //   correction = delta_mean * (t/2) / L * ackermann_pct
+    //
+    // At ackermann_pct = 0, both wheels steer identically. At 1.0, full
+    // geometric Ackermann. Negative values give anti-Ackermann.
+    struct SteerPair { double left, right; };
+
+    SteerPair compute_steer_angles(double steer_input) const {
+        double correction = steer_input * (params.track_width / 2.0)
+                          / params.wheelbase * params.ackermann_pct;
+        // Positive steer = left turn. FL is inside, steers more.
+        // FR is outside, steers less.
+        return { steer_input + correction, steer_input - correction };
+    }
+
+    std::array<WheelVel, 4> compute_wheel_velocities(const SteerPair& steer) const {
         std::array<WheelVel, 4> wv;
         double ht = params.track_width / 2;
 
-        // Wheel positions relative to CG (x fwd, y left)
         struct Pos { double x, y; };
         std::array<Pos, 4> wp = {{
             { params.cg_to_front,  ht},  // FL
@@ -182,8 +212,9 @@ struct Vehicle {
             double vyp = state.Vy_body + state.yaw_rate * wp[i].x;
 
             if (i == FL || i == FR) {
-                double cd = std::cos(steer_angle);
-                double sd = std::sin(steer_angle);
+                double delta = (i == FL) ? steer.left : steer.right;
+                double cd = std::cos(delta);
+                double sd = std::sin(delta);
                 wv[i].Vx =  vxp * cd + vyp * sd;
                 wv[i].Vy = -vxp * sd + vyp * cd;
             } else {
@@ -253,8 +284,9 @@ struct Vehicle {
 
         double drive_torque = state.drivetrain.get_drive_torque(input.throttle);
 
-        // Tire forces
-        auto wvel = compute_wheel_velocities(input.steer_angle);
+        // Tire forces — compute per-wheel steer angles for Ackermann
+        auto steer = compute_steer_angles(input.steer_angle);
+        auto wvel = compute_wheel_velocities(steer);
         for (int i = 0; i < 4; ++i)
             compute_tire_forces(state.tires[i], params.tire_params, wvel[i].Vx, wvel[i].Vy, dt);
 
@@ -295,7 +327,8 @@ struct Vehicle {
         }
 
         // Accumulate forces in body frame, compute yaw torque.
-        // Front tire forces get rotated back out of the steered frame.
+        // Front tire forces get rotated back from the steered frame using
+        // each wheel's individual steer angle (Ackermann).
         double ht = params.track_width / 2;
         VehicleForces out;
         double yaw_torque = 0;
@@ -304,8 +337,9 @@ struct Vehicle {
             double fx, fy;
 
             if (i == FL || i == FR) {
-                double cd = std::cos(input.steer_angle);
-                double sd = std::sin(input.steer_angle);
+                double delta = (i == FL) ? steer.left : steer.right;
+                double cd = std::cos(delta);
+                double sd = std::sin(delta);
                 fx = state.tires[i].Fx * cd - state.tires[i].Fy * sd;
                 fy = state.tires[i].Fx * sd + state.tires[i].Fy * cd;
             } else {

@@ -73,6 +73,14 @@ struct TireParams {
     double sr_peak = 0.15;   // 15% slip ratio
     double sa_peak = 0.14;   // [rad] ~8 deg
 
+    // Friction ellipse — the ratio of lateral grip capacity to longitudinal.
+    // 1.0 = circular (old behavior). Most tires are slightly elliptical:
+    // ~0.95 means lateral peak is 95% of longitudinal peak. Racing slicks
+    // can be more asymmetric (~0.90). This shapes the force envelope under
+    // combined loading — braking into a corner uses longitudinal grip that
+    // is slightly larger than the lateral grip you're asking for.
+    double friction_ellipse_ratio = 0.95;  // Fy_max / Fx_max
+
     // Relaxation length
     double relaxation_length = 0.4;  // [m]
 };
@@ -162,13 +170,23 @@ inline void compute_tire_forces(
         st.Fy = Fy0;
     }
 
-    // Friction circle — still needed as a hard backstop. The combined slip
-    // weighting handles the smooth interaction, but at extreme slips (both
-    // channels past their peaks) the weighting alone can overshoot.
-    double f_max = mu * Fz;
-    double f_total = std::sqrt(st.Fx * st.Fx + st.Fy * st.Fy);
-    if (f_total > f_max && f_total > 1e-6) {
-        double s = f_max / f_total;
+    // Rolling resistance — subtracted before the friction circle so it's
+    // part of the friction budget, not free. Without this, the total tire
+    // force can exceed mu * Fz by the rolling resistance amount.
+    // SIMPLIFICATION: constant Crr, no temp/pressure/speed dependence.
+    st.Fx -= p.rolling_resistance * Fz;
+
+    // Friction ellipse — the hard backstop on total tire force. An ellipse
+    // rather than a circle: longitudinal radius = mu * Fz, lateral radius =
+    // mu * Fz * friction_ellipse_ratio. The test is (Fx/a)^2 + (Fy/b)^2 <= 1.
+    // If exceeded, scale both components back along the radial direction.
+    double a_ell = mu * Fz;                          // longitudinal semi-axis
+    double b_ell = mu * Fz * p.friction_ellipse_ratio;  // lateral semi-axis
+    double ex = st.Fx / a_ell;
+    double ey = st.Fy / b_ell;
+    double e_mag = std::sqrt(ex * ex + ey * ey);
+    if (e_mag > 1.0 && e_mag > 1e-6) {
+        double s = 1.0 / e_mag;
         st.Fx *= s;
         st.Fy *= s;
     }
@@ -184,8 +202,4 @@ inline void compute_tire_forces(
         st.Fy_filtered += (Fy_target - st.Fy_filtered) * a;
         st.Fy = st.Fy_filtered;
     }
-
-    // Rolling resistance.
-    // SIMPLIFICATION: constant Crr, no temp/pressure/speed dependence.
-    st.Fx -= p.rolling_resistance * Fz;
 }
