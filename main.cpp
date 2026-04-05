@@ -29,9 +29,9 @@ constexpr int    LOG_SKIP = 12;            // log every 12th tick → ~10 Hz out
 // Any persistent drift means the integrator is creating or destroying energy.
 // Reported as energy_balance = (energy_in - losses) - ΔKE. Should stay near 0.
 //
-// When drivetrain inertia is added later, the KE calculation gains a
-// 0.5 * I_flywheel * omega_engine² term and the energy_in pathway splits
-// into engine→flywheel and flywheel→wheels.
+// Flywheel KE (0.5 * I_engine * omega_engine²) is included in ke_current.
+// The reflected inertia approach means wheel KE uses bare I_wheel and the
+// flywheel energy is tracked separately.
 
 struct EnergyAuditor {
     // Cumulative energy through each pathway [J]
@@ -62,7 +62,16 @@ struct EnergyAuditor {
         double ke_wheels = 0;
         for (int i = 0; i < 4; ++i)
             ke_wheels += 0.5 * I_wheel * s.tires[i].omega * s.tires[i].omega;
-        ke_current = ke_body + ke_wheels;
+
+        // Flywheel KE. Since we use bare I_wheel in the wheel KE calculation
+        // (not I_eff), we need to add the flywheel's rotational energy
+        // separately. When the clutch is engaged, omega_engine = omega_wheel
+        // × ratio, so this captures the reflected energy correctly. When the
+        // clutch is open, the flywheel has its own independent speed.
+        double ke_flywheel = 0.5 * s.drivetrain.I_engine
+                           * s.drivetrain.omega_engine
+                           * s.drivetrain.omega_engine;
+        ke_current = ke_body + ke_wheels + ke_flywheel;
 
         if (!initialized) {
             ke_initial = ke_current;
@@ -111,10 +120,6 @@ struct EnergyAuditor {
 
     void report() const {
         double delta_ke = ke_current - ke_initial;
-        double integrator_err = energy_body - (ke_current - ke_body_initial
-                              - (ke_initial - ke_body_initial));
-        // Simplifies to: energy_body - (ke_body_final - ke_body_initial)
-        // but we don't store ke_body_final, so use balance from last update.
         std::cerr << "\n── energy audit ──\n"
                   << "  KE initial:      " << ke_initial / 1000 << " kJ\n"
                   << "  KE final:        " << ke_current / 1000 << " kJ\n"

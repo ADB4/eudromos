@@ -16,14 +16,6 @@
 //                      physics server — you just feed it the force/torque
 //                      from compute_forces().
 //   step()           — calls both. For the standalone sim.
-//
-// Godot note: coordinate system is Z-up here, Godot is Y-up. Isolate the
-// conversion at the boundary (one rotation), don't let it leak into the
-// physics. The Vec3/Mat3 types are internal to the force computation;
-// the engine only sees the VehicleInput/VehicleForces structs.
-//
-// Beckman references: Part 1 (weight transfer), Part 2 (slip angle),
-// Part 3 (cornering force), Part 5 (centripetal accel), Parts 6-7 (Pacejka).
 
 #include "math_types.h"
 #include "tire.h"
@@ -34,72 +26,33 @@
 
 enum WheelID { FL = 0, FR = 1, RL = 2, RR = 3 };
 
-// --- Input: what the game feeds us each frame ---
-
 struct VehicleInput {
     double throttle   = 0;    // [0, 1]
     double brake      = 0;    // [0, 1]
     double steer_angle = 0;   // front wheels [rad], positive = left
 };
 
-// --- Output: what we hand back to the engine ---
-
 struct VehicleForces {
-    // Body-frame net force (X fwd, Y left). The engine rotates this to world
-    // frame using the body's current orientation, then applies it.
     double Fx_body = 0;
     double Fy_body = 0;
-
-    // Yaw torque about the body's Z axis [N·m].
     double yaw_torque = 0;
-
-    // Lateral accel in g (diagnostic, used for HUD / telemetry)
     double lateral_accel_g = 0;
 };
 
-// --- Params: everything that describes the car but doesn't change at runtime ---
-
 struct VehicleParams {
-    double mass = 1400;         // [kg], ~3100 lbs
-    double wheelbase = 2.6;     // [m]
-    double track_width = 1.55;  // [m]
-
-    // CG sits 1.17m behind the front axle → ~55/45 front weight bias (FR car)
+    double mass = 1400;
+    double wheelbase = 2.6;
+    double track_width = 1.55;
     double cg_to_front = 1.17;
-    double cg_to_rear = 1.43;   // cg_to_front + cg_to_rear = wheelbase
-    double cg_height = 0.50;    // [m] above ground
-
-    // Ackermann steering geometry. At 100% Ackermann, the inside wheel
-    // steers more than the outside so both front wheels point at the same
-    // turn center. At 0% both wheels steer identically (parallel steer).
-    // Most road cars run 60-80%. Some race cars run negative Ackermann
-    // (outside steers more) at high speed because the loaded outside tire
-    // needs more slip angle. The bicycle model steer angle is the average
-    // of the two wheels.
-    double ackermann_pct = 0.6;  // [-] 0 = parallel, 1 = full Ackermann
-
-    // SIMPLIFICATION: no roll/pitch DOF in integrator — just yaw on flat ground.
-    double Izz = 2800;  // yaw moment of inertia [kg·m²]
-
-    // Aero drag.
-    // At ~56 m/s (200 kph): F_drag ≈ 0.5 * 1.225 * 0.35 * 2.2 * 56² ≈ 1500 N
+    double cg_to_rear = 1.43;
+    double cg_height = 0.50;
+    double ackermann_pct = 0.6;
+    double Izz = 2800;
     double drag_coefficient = 0.35;
     double frontal_area = 2.2;
     double air_density = 1.225;
-
-    // Aero downforce. Cl*A is the lift coefficient times reference area — same
-    // form as drag (F = 0.5 * rho * Cl*A * V²), but pushing the car down
-    // instead of back. Street cars have nearly zero; a GT3 car might be 2.5-3.0;
-    // an LMP or F1 car can be 4-5+. Defaulting to mild track-day aero — small
-    // wing and splitter.
-    //
-    // aero_balance is the fraction of total downforce on the front axle.
-    // 0.4 = 40% front, 60% rear — typical for rear-wing-dominant setups.
-    // This directly controls high-speed understeer/oversteer: more front
-    // downforce = more front grip at speed = less understeer (or more oversteer).
-    // It's the primary setup knob on any aero car.
-    double downforce_ClA = 1.2;       // [m²] Cl * A — mild aero
-    double aero_balance_front = 0.40; // [-] fraction of downforce on front axle
+    double downforce_ClA = 1.2;
+    double aero_balance_front = 0.40;
 
     TireParams tire_params;
     SuspensionParams suspension_params;
@@ -109,27 +62,16 @@ struct VehicleParams {
     }
 };
 
-// --- State: everything that evolves between frames ---
-//
-// position/velocity/yaw live here for the standalone sim. When the engine
-// owns the rigid body, you still need the rest (tire states, suspension
-// deflections, drivetrain internals, wheel spin). The engine feeds you back
-// the current velocity/yaw_rate each frame through the body-frame transform.
-
 struct VehicleState {
-    // Rigid body — owned by us in standalone, by the engine in-game
     Vec3 position = {0, 0, 0};
     Vec3 velocity = {0, 0, 0};
     double yaw = 0;
     double yaw_rate = 0;
 
-    // Internal physics state — always ours
     std::array<TireState, 4> tires;
     Drivetrain drivetrain;
     SuspensionState suspension;
 
-    // Body-frame velocity, recomputed each tick from the world-frame velocity
-    // and current yaw. In-engine, you'd get this from the physics server.
     double Vx_body = 0;
     double Vy_body = 0;
 
@@ -141,10 +83,6 @@ struct Vehicle {
     VehicleParams params;
     VehicleState state;
 
-    // Set static normal loads so the car doesn't start with Fz=0 on frame 1.
-    // Also sets Fz_nominal for load sensitivity — each corner's reference load
-    // is its own static weight. Front corners are heavier on this car (55/45),
-    // so they lose proportionally more mu under lateral transfer.
     void init() {
         constexpr double g = 9.81;
         double L = params.wheelbase;
@@ -156,42 +94,19 @@ struct Vehicle {
             state.tires[i].normal_load = loads[i];
             state.suspension.corners[i].force = loads[i];
         }
-
-        // Fz_nominal = average static corner load. Using the average rather
-        // than per-corner values means the front (heavier) tires start with
-        // mu slightly below mu_peak and the rear slightly above, which is a
-        // mild built-in understeer bias. You could use per-corner Fz_nom
-        // instead if you want load sensitivity to be purely about *transfer*.
         params.tire_params.Fz_nominal = W / 4.0;
+
+        // Start with clutch disengaged at standstill so the launch
+        // sequence works properly (auto-clutch ramps it in).
+        state.drivetrain.clutch_state.clutch_input = 0.0;
     }
 
-    // --- Force computation: the part you own forever ---
-    //
-    // Reads current state + input, writes tire/suspension/drivetrain internals,
-    // returns net body-frame force and yaw torque. Does NOT touch position,
-    // velocity, yaw, or yaw_rate.
-
     struct WheelVel { double Vx, Vy; };
-
-    // Ackermann geometry: the inside wheel steers more than the outside.
-    // For a left turn (positive steer), FL is the inside wheel.
-    //
-    // Full Ackermann: each wheel points at the instantaneous turn center,
-    // so tan(delta_inside) = L / (R - t/2) and tan(delta_outside) = L / (R + t/2).
-    // For small angles this simplifies to a linear split around the mean:
-    //   delta_inside  = delta_mean + ackermann_correction
-    //   delta_outside = delta_mean - ackermann_correction
-    //   correction = delta_mean * (t/2) / L * ackermann_pct
-    //
-    // At ackermann_pct = 0, both wheels steer identically. At 1.0, full
-    // geometric Ackermann. Negative values give anti-Ackermann.
     struct SteerPair { double left, right; };
 
     SteerPair compute_steer_angles(double steer_input) const {
         double correction = steer_input * (params.track_width / 2.0)
                           / params.wheelbase * params.ackermann_pct;
-        // Positive steer = left turn. FL is inside, steers more.
-        // FR is outside, steers less.
         return { steer_input + correction, steer_input - correction };
     }
 
@@ -201,10 +116,10 @@ struct Vehicle {
 
         struct Pos { double x, y; };
         std::array<Pos, 4> wp = {{
-            { params.cg_to_front,  ht},  // FL
-            { params.cg_to_front, -ht},  // FR
-            {-params.cg_to_rear,   ht},  // RL
-            {-params.cg_to_rear,  -ht},  // RR
+            { params.cg_to_front,  ht},
+            { params.cg_to_front, -ht},
+            {-params.cg_to_rear,   ht},
+            {-params.cg_to_rear,  -ht},
         }};
 
         for (int i = 0; i < 4; ++i) {
@@ -228,18 +143,12 @@ struct Vehicle {
     VehicleForces compute_forces(const VehicleInput& input, double dt) {
         constexpr double g = 9.81;
 
-        // World → body frame velocity.
-        // In-engine, you'd get Vx_body/Vy_body from the physics server's
-        // local velocity instead of doing this rotation yourself.
         Mat3 R = Mat3::from_yaw(state.yaw);
         Mat3 Rt = R.transposed();
         Vec3 vb = Rt * state.velocity;
         state.Vx_body = vb.x;
         state.Vy_body = vb.y;
 
-        // Estimate body-frame accelerations for the suspension.
-        // Lateral: centripetal (Vx * yaw_rate) is more stable than summing Fy.
-        // Longitudinal: sum previous-frame Fx. One frame stale, but it's fine.
         double ay_centripetal = state.Vx_body * state.yaw_rate;
         double ax_est = 0;
         for (int i = 0; i < 4; ++i) ax_est += state.tires[i].Fx;
@@ -255,15 +164,7 @@ struct Vehicle {
         for (int i = 0; i < 4; ++i)
             state.tires[i].normal_load = state.suspension.corners[i].force;
 
-        // Aero downforce — adds normal load without adding mass. Scales with
-        // V², so it's negligible at low speed and dominant at high speed.
-        // Because of load sensitivity, this is sublinear in grip gain — but
-        // it's still free grip that costs no weight transfer penalty. That's
-        // why aero cars corner so much harder than their weight suggests.
-        //
-        // The downforce acts at the contact patch, not at the CG, so it
-        // doesn't go through the suspension springs. It's added directly
-        // to the tire's normal load after the suspension has done its thing.
+        // Aero downforce
         double V2 = state.Vx_body * state.Vx_body + state.Vy_body * state.Vy_body;
         double F_down = 0.5 * params.air_density * params.downforce_ClA * V2;
         double F_down_front = F_down * params.aero_balance_front;
@@ -274,24 +175,50 @@ struct Vehicle {
         state.tires[RL].normal_load += F_down_rear  / 2.0;
         state.tires[RR].normal_load += F_down_rear  / 2.0;
 
-        // Drivetrain
+        // ── Drivetrain with clutch model ──
+        //
+        // The engine is always integrated as a free rotational body. The
+        // clutch transfers torque between engine and gearbox input shaft
+        // based on speed difference and engagement level.
+        //
+        // Flow:
+        //   1. Update shift state machine (clutch engage/disengage ramps)
+        //   2. Auto-clutch for launch (ramps engagement at standstill)
+        //   3. Auto-shift (triggers new shifts based on RPM)
+        //   4. Integrate omega_engine (T_engine - T_clutch) / I_engine
+        //   5. Drive torque at wheels = T_clutch × ratio × efficiency
+        //   6. Diff splits drive torque between RL and RR
+        //   7. Wheel spin: bare I_wheel only (no reflected inertia needed —
+        //      the clutch coupling handles everything)
+
         double omega_rear = (state.tires[RL].omega + state.tires[RR].omega) / 2;
-        state.drivetrain.update_rpm_from_wheel_speed(omega_rear);
-        state.drivetrain.auto_shift(input.throttle);
+
+        // Shift state machine: manages clutch ramps during gear changes
+        state.drivetrain.update_shift_state(dt);
         state.drivetrain.gearbox.update(dt);
         if (state.drivetrain.shift_lockout_timer > 0)
             state.drivetrain.shift_lockout_timer -= dt;
 
-        double drive_torque = state.drivetrain.get_drive_torque(input.throttle);
+        // Auto-clutch for launch: ramps engagement when accelerating from stop
+        state.drivetrain.update_auto_clutch_launch(input.throttle, omega_rear, dt);
 
-        // Tire forces — compute per-wheel steer angles for Ackermann
+        // Auto-shift: triggers new shift sequences based on RPM
+        state.drivetrain.auto_shift(input.throttle);
+
+        // Integrate engine speed. This computes T_clutch internally and
+        // stores it in clutch_state.torque_transmitted.
+        state.drivetrain.update_engine(input.throttle, omega_rear, dt);
+
+        // Drive torque at wheels comes from the clutch, through the gearbox
+        double drive_torque = state.drivetrain.get_drive_torque_from_clutch();
+
+        // Tire forces
         auto steer = compute_steer_angles(input.steer_angle);
         auto wvel = compute_wheel_velocities(steer);
         for (int i = 0; i < 4; ++i)
             compute_tire_forces(state.tires[i], params.tire_params, wvel[i].Vx, wvel[i].Vy, dt);
 
-        // Differential — splits drive torque between rear wheels based on
-        // their speed difference and the diff type (open/locked/LSD).
+        // Differential
         DiffState diff = diff_split_torque(
             state.drivetrain.diff_params,
             drive_torque,
@@ -300,8 +227,10 @@ struct Vehicle {
         );
         state.drivetrain.diff_state = diff;
 
-        // Wheel spin dynamics: I_w * domega/dt = drive - brake - Fx*R
-        // SIMPLIFICATION: lumped inertia, no separate brake rotor/hub
+        // Wheel spin dynamics — bare wheel inertia only.
+        // No reflected engine inertia needed: the clutch coupling handles
+        // the engine-wheel interaction through torque, not through shared
+        // inertia. The engine is its own DOF now.
         constexpr double I_wheel = 1.5;  // [kg·m²]
         double tire_R = params.tire_params.radius;
 
@@ -317,18 +246,15 @@ struct Vehicle {
             if (state.tires[i].omega > 0.01)       torque -= brake_torque;
             else if (state.tires[i].omega < -0.01)  torque += brake_torque;
 
-            torque -= state.tires[i].Fx * tire_R;  // ground reaction
+            torque -= state.tires[i].Fx * tire_R;
 
             state.tires[i].omega += (torque / I_wheel) * dt;
 
-            // Crude wheel-lock prevention (not really ABS, just a clamp)
             if (input.brake > 0 && state.tires[i].omega < 0 && state.Vx_body > 0.5)
                 state.tires[i].omega = 0;
         }
 
-        // Accumulate forces in body frame, compute yaw torque.
-        // Front tire forces get rotated back from the steered frame using
-        // each wheel's individual steer angle (Ackermann).
+        // Force accumulation
         double ht = params.track_width / 2;
         VehicleForces out;
         double yaw_torque = 0;
@@ -350,13 +276,12 @@ struct Vehicle {
             out.Fx_body += fx;
             out.Fy_body += fy;
 
-            // yaw moment = r × F (z component of 2D cross product)
             double rx = (i <= FR) ? params.cg_to_front : -params.cg_to_rear;
             double ry = (i == FL || i == RL) ? ht : -ht;
             yaw_torque += rx * fy - ry * fx;
         }
 
-        // Aero drag in body frame (downforce is already applied to tire Fz above)
+        // Aero drag
         double spd = state.speed_mps();
         if (spd > 0.1) {
             double Fd = 0.5 * params.air_density * params.drag_coefficient
@@ -370,15 +295,6 @@ struct Vehicle {
 
         return out;
     }
-
-    // --- Integration: the part the engine replaces ---
-    //
-    // Semi-implicit Euler. Body-frame force → world, then F=ma.
-    // In Godot, you'd call compute_forces() in _physics_process(), then do:
-    //   var f_world = transform.basis * Vector3(forces.Fx_body, 0, -forces.Fy_body)
-    //   apply_central_force(f_world)
-    //   apply_torque(Vector3(0, forces.yaw_torque, 0))
-    // (with the coordinate swap — Z-up to Y-up)
 
     void integrate(const VehicleForces& forces, double dt) {
         Mat3 R = Mat3::from_yaw(state.yaw);
@@ -395,8 +311,6 @@ struct Vehicle {
         while (state.yaw > M_PI)  state.yaw -= 2 * M_PI;
         while (state.yaw < -M_PI) state.yaw += 2 * M_PI;
     }
-
-    // --- Standalone convenience: compute + integrate in one call ---
 
     void step(const VehicleInput& input, double dt) {
         VehicleForces forces = compute_forces(input, dt);

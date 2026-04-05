@@ -1,11 +1,27 @@
 #pragma once
-// drivetrain.h — engine torque curve, gearbox, differential, RWD drive logic.
+// drivetrain.h — engine, clutch, gearbox, differential, RWD.
 //
-// No clutch (instant engagement), no flywheel inertia. Diff model covers
-// open, locked, and 1-way / 1.5-way / 2-way clutch-pack LSD.
+// The engine is a separate rotational DOF (omega_engine) coupled to the
+// wheels through a friction-disk clutch and gearbox. omega_engine is always
+// integrated independently — the clutch transfers torque between the engine
+// and the gearbox input shaft, but never locks them rigidly.
 //
-// std::vector replaced with std::array — these are fixed at compile time and
-// the heap allocations were gratuitous. Matters when you're spawning traffic.
+// Clutch model: uses the same tanh-based smooth coupling as the LSD diff.
+// The clutch has a torque capacity (T_clutch_max) set by spring pressure.
+// When the speed difference between engine and gearbox input is small, the
+// clutch transmits nearly all engine torque. When the difference is large
+// (launch, shift re-engagement), it slips — the transmitted torque is
+// limited by T_clutch_max. This avoids a discrete lock/slip state machine
+// and is unconditionally stable at 120 Hz.
+//
+// Launch behavior: the clutch engages progressively based on a clutch_input
+// ramp (0 = disengaged, 1 = fully clamped). At standstill with throttle
+// applied, the engine spins up freely until the clutch begins to bite, then
+// torque flows to the wheels proportional to the engagement and speed diff.
+//
+// Shifts: clutch opens (clutch_input = 0), gear changes, clutch re-engages
+// with a fast ramp (~125ms). Ignition is cut during upshifts to prevent the
+// engine from free-revving to the limiter.
 
 #include <cmath>
 #include <algorithm>
@@ -50,9 +66,9 @@ struct Gearbox {
     static constexpr int N_GEARS = 6;
     std::array<double, N_GEARS> ratios = {3.58, 2.02, 1.35, 1.00, 0.77, 0.63};
     double final_drive = 3.42;
-    int current_gear = 0;         // 0-indexed
-    double shift_cooldown = 0.0;  // time left in current shift
-    double shift_time = 0.2;      // seconds per shift
+    int current_gear = 0;
+    double shift_cooldown = 0.0;
+    double shift_time = 0.2;
 
     double total_ratio() const {
         if (current_gear < 0 || current_gear >= N_GEARS) return 0;
@@ -82,96 +98,42 @@ struct Gearbox {
 };
 
 // --- Differential ---
-//
-// Three types that cover most real cars:
-//
-//   open:   torque splits 50/50 regardless of speed difference. The inside
-//           wheel spins up freely in a corner, the outside can't get more
-//           than 50% of the input. This is why FWD economy cars spin an
-//           inside wheel out of slow corners.
-//
-//   locked: both axle shafts turn at the same speed. Maximum traction but
-//           the car fights you in corners — the inside wheel scrubs because
-//           it's forced to turn faster than it wants to. Karts and drift
-//           cars run this. Causes tight-corner understeer (RWD) because the
-//           inside rear pushes the car wide.
-//
-//   lsd:    clutch-pack limited-slip. A preload torque keeps the clutch
-//           plates slightly engaged at all times. On top of that, the
-//           clutch locks proportionally to input torque (ramp angle effect).
-//           The locking torque limits how much speed difference the diff
-//           allows. Behaves like open at low torque, trends toward locked
-//           under power.
-//
-//           coast_lock_ratio vs power_lock_ratio: a 1.5-way LSD has lower
-//           coast locking — it lets the diff open up on decel, so trail
-//           braking still gets rear rotation. A 2-way has equal lock both
-//           directions (drifting). A 1-way only locks on power (some FFs).
-//
-// The model: the diff always splits base torque 50/50 (it's a gear set,
-// that's what it does). The clutch pack adds a *locking torque* that
-// transfers torque from the faster wheel to the slower wheel. The locking
-// torque is: T_lock = preload + ramp * |T_input|, capped so it can't
-// exceed half the input (fully locked = both wheels get exactly 50%).
-//
-// For locked mode, we don't literally lock the speeds (that would need a
-// constraint solver). Instead we apply a very stiff coupling torque
-// proportional to the speed difference, which drives them together within
-// a few timesteps. Cheaper than a constraint and stable at 120 Hz.
 
 enum class DiffType { OPEN, LOCKED, LSD };
 
 struct DiffParams {
     DiffType type = DiffType::LSD;
-
-    // LSD parameters — clutch-pack style
-    double preload          = 40.0;   // [Nm] always-on friction, even at zero throttle
-    double power_lock_ratio = 0.25;   // [-] fraction of input torque that locks (power)
-    double coast_lock_ratio = 0.15;   // [-] fraction of input torque that locks (coast/decel)
-
-    // Locked mode stiffness — high enough to equalize within a few frames,
-    // low enough to not blow up the integrator. 5000 Nm/(rad/s) works at 120 Hz.
-    double lock_stiffness = 5000.0;   // [Nm/(rad/s)]
+    double preload          = 40.0;
+    double power_lock_ratio = 0.25;
+    double coast_lock_ratio = 0.15;
+    double lock_stiffness = 5000.0;
 };
 
 struct DiffState {
-    double torque_left  = 0;  // [Nm] at the wheel (diagnostic)
-    double torque_right = 0;  // [Nm] at the wheel (diagnostic)
-    double lock_torque  = 0;  // [Nm] how much the clutch is transferring (diagnostic)
+    double torque_left  = 0;
+    double torque_right = 0;
+    double lock_torque  = 0;
 };
 
 inline DiffState diff_split_torque(
     const DiffParams& p,
-    double total_torque,     // [Nm] total drive torque arriving at the diff
-    double omega_left,       // [rad/s] left wheel speed
-    double omega_right       // [rad/s] right wheel speed
+    double total_torque,
+    double omega_left,
+    double omega_right
 ) {
     DiffState out;
     double half = total_torque / 2.0;
-    double delta_omega = omega_left - omega_right;  // positive = left faster
+    double delta_omega = omega_left - omega_right;
 
     switch (p.type) {
 
     case DiffType::OPEN:
-        // Pure open diff: 50/50 torque, no speed coupling at all. The wheels
-        // are free to spin at different rates. One-liner, but it means the
-        // tire with less grip limits the whole axle.
         out.torque_left  = half;
         out.torque_right = half;
         out.lock_torque  = 0;
         break;
 
     case DiffType::LOCKED: {
-        // Stiff coupling drives the speed difference toward zero. This is
-        // a spring-like torque: T = -k * (omega_L - omega_R). The fast
-        // wheel loses torque, the slow wheel gains it.
-        //
-        // Must clamp the coupling — otherwise the stiff spring overshoots
-        // and you get an oscillation that blows up. The clamp ensures the
-        // lock torque can't reverse the speed difference in a single
-        // timestep (which it would at high stiffness and low wheel inertia).
-        // Also cap at a physical maximum — the tire can only transmit so
-        // much torque before it just slides.
         double lock = p.lock_stiffness * delta_omega;
         double max_lock = std::max(std::abs(half), 3000.0);
         lock = std::clamp(lock, -max_lock, max_lock);
@@ -182,34 +144,11 @@ inline DiffState diff_split_torque(
     }
 
     case DiffType::LSD: {
-        // Clutch-pack LSD. The clutch friction depends on how much torque
-        // is going through the diff (ramp angle effect) plus a static preload.
-        //
-        // Under power, locking is stronger (power_lock_ratio) — the diff
-        // resists the inside wheel spinning up, sending more torque to the
-        // outside. Under coast, locking is weaker (coast_lock_ratio) — the
-        // diff opens up more, letting the inside wheel decelerate freely.
-        // This is what makes trail braking work with an LSD: you want the
-        // rear to be able to rotate the car on decel.
         bool on_power = (total_torque > 0);
         double ramp = on_power ? p.power_lock_ratio : p.coast_lock_ratio;
-
-        // Maximum locking torque available from the clutch pack
         double T_lock_max = p.preload + ramp * std::abs(total_torque);
-
-        // The clutch engages proportionally to speed difference — think of
-        // it as a viscous coupling limited by the clutch capacity. The tanh
-        // gives a smooth transition from slipping to locked without a
-        // discontinuity. Scale factor chosen so ~2 rad/s difference ≈ 75%
-        // of max locking.
         double lock_demand = T_lock_max * std::tanh(delta_omega / 2.0);
-
-        // Clamp: locking torque can't exceed half the input — that would
-        // mean one wheel gets negative torque and the other gets more than
-        // 100%, which is nonsensical for a passive diff.
         lock_demand = std::clamp(lock_demand, -std::abs(half), std::abs(half));
-
-        // Transfer from fast wheel to slow wheel
         out.torque_left  = half - lock_demand;
         out.torque_right = half + lock_demand;
         out.lock_torque  = lock_demand;
@@ -220,71 +159,251 @@ inline DiffState diff_split_torque(
     return out;
 }
 
+// --- Clutch ---
+//
+// Friction-disk clutch between engine and gearbox input shaft. Same tanh
+// pattern as the LSD diff: smooth transition, no state machine for lock/slip,
+// unconditionally stable at 120 Hz.
+//
+//   omega_gearbox_input = omega_wheel_avg × gear_ratio
+//   delta_omega = omega_engine - omega_gearbox_input
+//   T_clutch = clutch_input × T_max × tanh(delta_omega / omega_scale)
+//
+// The clutch torque acts on both sides: it decelerates the engine and
+// accelerates the wheels. The engine sees:
+//   I_engine × d(omega_engine)/dt = T_engine - T_clutch
+// The wheels see: T_clutch × ratio × efficiency as drive torque.
+
+struct ClutchParams {
+    // Maximum torque when fully clamped. 1.3-1.5× peak engine torque.
+    // Peak is 270 Nm → 400 Nm gives good margin without excess slip.
+    double torque_capacity = 400.0;  // [Nm]
+
+    // Speed difference scale for tanh. At omega_scale, the clutch transmits
+    // ~76% of capacity. 5 rad/s ≈ 48 RPM — quite stiff, realistic for a
+    // properly-sized friction disk. Most slip happens in the first ~100 RPM.
+    double omega_scale = 5.0;  // [rad/s]
+
+    // Auto-clutch engagement rate for launch [1/s]. 2.0 = 0→1 in 0.5s.
+    double engage_rate = 2.0;
+
+    // Disengage rate for shifts. Fast — clutch opens in ~50ms.
+    double disengage_rate = 20.0;  // [1/s]
+
+    // Re-engage rate after shift completion. ~125ms to full engagement.
+    double shift_engage_rate = 8.0;  // [1/s]
+};
+
+struct ClutchState {
+    double clutch_input = 1.0;        // [0,1] engagement level
+    double torque_transmitted = 0.0;  // [Nm] actual torque this frame
+    double slip_speed = 0.0;          // [rad/s] omega_engine - omega_gearbox_input
+};
+
+// --- Drivetrain ---
+
 struct Drivetrain {
     EngineTorqueCurve engine;
     Gearbox gearbox;
     DiffParams diff_params;
-    DiffState diff_state;  // last frame's output, for diagnostics
+    DiffState diff_state;
+    ClutchParams clutch_params;
+    ClutchState clutch_state;
 
     double engine_rpm = 1000;
-    double brake_torque_max = 3000;    // total, all 4 wheels [Nm]
+    double brake_torque_max = 3000;
     double engine_braking_factor = 0.02;
-
-    // Brake bias: fraction of total braking that goes to the front axle.
-    // 0.6 = 60% front, 40% rear — typical street car with front weight bias.
-    // Higher = more front braking = more stable under braking but less rear
-    // deceleration, so you waste front grip. Lower = more rear braking =
-    // better threshold braking but easier to lock the rears and spin.
-    // Race cars run adjustable bias, usually 55-65% front depending on setup.
     double brake_bias_front = 0.6;
-
-    // Anti-hunt timer: after a shift, lock out further shifts for a bit.
-    // Without this, the RPM drop from an upshift can trigger an immediate
-    // downshift and you get gear oscillation.
     double shift_lockout_timer = 0;
 
-    void update_rpm_from_wheel_speed(double omega_wheel) {
-        double ratio = gearbox.total_ratio();
-        if (ratio < 0.01) { engine_rpm = engine.idle_rpm(); return; }
-        double computed = std::abs(omega_wheel) * ratio * (60.0 / (2.0 * M_PI));
-        engine_rpm = std::clamp(computed, engine.idle_rpm(), engine.max_rpm());
+    // Engine inertia
+    double I_engine = 0.18;           // [kg·m²]
+    double omega_engine = 104.72;     // [rad/s] = 1000 rpm
+    double transmission_efficiency = 0.88;
+
+    // Shift state machine: NONE → DISENGAGE → SHIFTING → ENGAGE → NONE
+    enum class ShiftPhase { NONE, DISENGAGE, SHIFTING, ENGAGE };
+    ShiftPhase shift_phase = ShiftPhase::NONE;
+    bool ignition_cut = false;
+    bool shift_is_upshift = false;
+
+    // ── RPM ──
+
+    void update_rpm_from_omega_engine() {
+        engine_rpm = std::clamp(
+            std::abs(omega_engine) * (60.0 / (2.0 * M_PI)),
+            engine.idle_rpm(),
+            engine.max_rpm()
+        );
     }
 
-    // Returns total drive torque at the wheels (caller runs it through the diff).
-    double get_drive_torque(double throttle) const {
-        if (gearbox.is_shifting()) return 0;
+    // ── Engine torque ──
+    //
+    // Includes ignition cut (upshifts) and idle governor (anti-stall).
 
-        double ratio = gearbox.total_ratio();
+    double get_engine_torque(double throttle) const {
+        if (ignition_cut) return 0;
+
         double t_engine = engine.torque_at_rpm(engine_rpm) * throttle;
 
-        // Engine braking (off-throttle): small retarding torque from pumping losses
+        // Engine braking
         if (throttle < 0.01 && engine_rpm > engine.idle_rpm()) {
             t_engine = -engine_braking_factor * engine.torque_at_rpm(engine_rpm)
                        * (engine_rpm / engine.max_rpm());
         }
 
-        // SIMPLIFICATION: constant 88% transmission efficiency
-        return t_engine * ratio * 0.88;
+        // Idle governor: prevent stalling. Linear ramp from 0 Nm at 1100 RPM
+        // to 30 Nm at idle (1000 RPM). Gentle enough not to fight the clutch
+        // during normal operation.
+        if (engine_rpm < 1100) {
+            double idle_authority = 30.0 * (1.0 - (engine_rpm - engine.idle_rpm()) / 100.0);
+            idle_authority = std::clamp(idle_authority, 0.0, 30.0);
+            t_engine = std::max(t_engine, idle_authority);
+        }
+
+        return t_engine;
     }
 
-    // Brake torque per wheel, split by bias. Front gets brake_bias_front of
-    // the total, rear gets the rest. Each axle has two wheels, so divide by 2.
+    // ── Clutch torque ──
+
+    double compute_clutch_torque(double omega_gearbox_input) {
+        double delta_omega = omega_engine - omega_gearbox_input;
+        clutch_state.slip_speed = delta_omega;
+
+        double T_max = clutch_state.clutch_input * clutch_params.torque_capacity;
+        if (T_max < 0.1) {
+            clutch_state.torque_transmitted = 0;
+            return 0;
+        }
+
+        double T_clutch = T_max * std::tanh(delta_omega / clutch_params.omega_scale);
+        clutch_state.torque_transmitted = T_clutch;
+        return T_clutch;
+    }
+
+    // ── Drive torque at wheels ──
+
+    double get_drive_torque_from_clutch() const {
+        double ratio = gearbox.total_ratio();
+        return clutch_state.torque_transmitted * ratio * transmission_efficiency;
+    }
+
+    // Legacy interface for energy auditor
+    double get_drive_torque(double /*throttle*/) const {
+        return get_drive_torque_from_clutch();
+    }
+
+    // ── Brakes ──
+
     double get_brake_torque_per_wheel(double brake_input, bool is_front) const {
         double total = brake_input * brake_torque_max;
         double axle_frac = is_front ? brake_bias_front : (1.0 - brake_bias_front);
         return total * axle_frac / 2.0;
     }
 
+    // ── Auto-clutch for launch ──
+
+    void update_auto_clutch_launch(double throttle, double omega_wheel_avg, double dt) {
+        if (shift_phase != ShiftPhase::NONE) return;
+
+        bool at_standstill = std::abs(omega_wheel_avg) < 2.0;
+
+        if (at_standstill && throttle > 0.05 && clutch_state.clutch_input < 1.0) {
+            double rate = clutch_params.engage_rate * (0.5 + throttle * 0.5);
+            clutch_state.clutch_input += rate * dt;
+            clutch_state.clutch_input = std::min(clutch_state.clutch_input, 1.0);
+        } else if (at_standstill && throttle < 0.01) {
+            clutch_state.clutch_input = 1.0;
+        }
+
+        if (!at_standstill && shift_phase == ShiftPhase::NONE) {
+            clutch_state.clutch_input = 1.0;
+        }
+    }
+
+    // ── Shift logic ──
+
     void auto_shift(double throttle) {
         if (shift_lockout_timer > 0) return;
+        if (shift_phase != ShiftPhase::NONE) return;
 
         if (engine_rpm >= 6500 && throttle > 0.5) {
-            gearbox.shift_up();
+            shift_phase = ShiftPhase::DISENGAGE;
+            shift_is_upshift = true;
             shift_lockout_timer = 1.0;
         } else if (engine_rpm <= 1800 && throttle > 0.5 && gearbox.current_gear > 0) {
-            gearbox.shift_down();
+            shift_phase = ShiftPhase::DISENGAGE;
+            shift_is_upshift = false;
             shift_lockout_timer = 1.0;
         }
-        // no rev-matching, no brake-downshift
+    }
+
+    void update_shift_state(double dt) {
+        switch (shift_phase) {
+
+        case ShiftPhase::NONE:
+            ignition_cut = false;
+            break;
+
+        case ShiftPhase::DISENGAGE:
+            clutch_state.clutch_input -= clutch_params.disengage_rate * dt;
+            if (clutch_state.clutch_input <= 0) {
+                clutch_state.clutch_input = 0;
+                if (shift_is_upshift) {
+                    gearbox.shift_up();
+                    ignition_cut = true;
+                } else {
+                    gearbox.shift_down();
+                    ignition_cut = false;
+                }
+                shift_phase = ShiftPhase::SHIFTING;
+            }
+            break;
+
+        case ShiftPhase::SHIFTING:
+            clutch_state.clutch_input = 0;
+            if (!gearbox.is_shifting()) {
+                shift_phase = ShiftPhase::ENGAGE;
+                ignition_cut = false;
+            }
+            break;
+
+        case ShiftPhase::ENGAGE:
+            clutch_state.clutch_input += clutch_params.shift_engage_rate * dt;
+            if (clutch_state.clutch_input >= 1.0) {
+                clutch_state.clutch_input = 1.0;
+                shift_phase = ShiftPhase::NONE;
+            }
+            break;
+        }
+    }
+
+    // ── Main update: integrate omega_engine ──
+    //
+    // The engine is always a free rotational body:
+    //   I_engine × d(omega_engine)/dt = T_engine - T_clutch
+    //
+    // When the clutch is fully engaged and speeds are matched, T_clutch ≈
+    // T_engine and omega_engine barely changes — the system behaves like
+    // the old reflected-inertia model. When the clutch is slipping or open,
+    // the engine evolves independently.
+
+    void update_engine(double throttle, double omega_wheel_avg, double dt) {
+        double ratio = gearbox.total_ratio();
+        double omega_gearbox_input = (ratio > 0.01)
+            ? std::abs(omega_wheel_avg) * ratio
+            : 0.0;
+
+        double T_clutch = compute_clutch_torque(omega_gearbox_input);
+        double T_engine = get_engine_torque(throttle);
+
+        double alpha_engine = (T_engine - T_clutch) / I_engine;
+        omega_engine += alpha_engine * dt;
+
+        double omega_idle = engine.idle_rpm() * (2.0 * M_PI / 60.0);
+        double omega_max  = engine.max_rpm()  * (2.0 * M_PI / 60.0);
+        omega_engine = std::clamp(omega_engine, omega_idle, omega_max);
+
+        update_rpm_from_omega_engine();
     }
 };
